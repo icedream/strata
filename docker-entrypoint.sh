@@ -99,7 +99,7 @@ fi
 # cards for this model, and setup.py saves them in its config; without them a config
 # that names one card is offered once to a pair, on its own, when the host has two
 # cards that can share the model (setup.py's offer_together, docs/MULTI_GPU.md).
-set -- --port "$PORT"
+set -- --port "$PORT" --host "$HOST"
 if [ -n "$GPUS" ]; then set -- "$@" --gpus "$GPUS"; fi
 if [ -n "$GPU" ]; then set -- "$@" --gpu "$GPU"; fi
 if [ -n "$LAYER_SPLIT" ]; then set -- "$@" --layer-split "$LAYER_SPLIT"; fi
