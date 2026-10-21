@@ -2,18 +2,9 @@
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_cache_refuse.hpp"
 
-// #533's segmented cache uses CUDA's virtual memory management (cuMem*): not on HIP, neither the RDNA backend nor
-// the gfx906 compat build (PR #638), which compiles this file as HIP without STRATA_USE_HIP
-#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906) || defined(STRATA_GPU_METAL)
-#define STRATA_EC_NO_VMM 1
-#endif
-
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
-#if !defined(STRATA_EC_NO_VMM)
-#include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
-#endif
 
 #include <algorithm>
 #include <atomic>
@@ -23,95 +14,14 @@
 #include <utility>
 #include <cstring>
 
-// (not in a SYCL build: its CUDA names are a compatibility layer without the PCI ids NVML is matched by)
-#if defined(_WIN32) && !defined(STRATA_EC_NO_VMM) && !defined(SYCL_LANGUAGE_VERSION)
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <windows.h>
-#define STRATA_EC_NVML_FREE 1
-#endif
-
 namespace strata::core {
-
-#if defined(STRATA_EC_NVML_FREE)
-namespace {
-
-// STRATA_VRAM_FREE=device (opt-in, Windows + NVIDIA).  Under WDDM cudaMemGetInfo answers for THIS process: memory
-// another process holds on the card (the image encoder, a browser, another engine) is not in its free figure.
-// Measured on an RTX 5090, driver 610.88: with 6 GiB written by another process, cudaMemGetInfo in a second process
-// still read 30,994 MiB free where NVML read 24,348.  NVML (nvml.dll, installed with every driver) counts the whole
-// card.  The library is loaded from the system directory only, at first use; false when it cannot answer.
-bool nvml_device_free(size_t& out) {
-    struct Memory { unsigned long long total, free, used; };
-    typedef int (*InitFn)(void);
-    typedef int (*ByBusFn)(const char*, void**);
-    typedef int (*MemFn)(void*, Memory*);
-    struct Lib {
-        ByBusFn by_bus = nullptr;
-        MemFn mem = nullptr;
-        Lib() {
-            HMODULE h = LoadLibraryExW(L"nvml.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
-            if (h == nullptr) return;
-            const auto init = (InitFn) (void*) GetProcAddress(h, "nvmlInit_v2");
-            const auto bus = (ByBusFn) (void*) GetProcAddress(h, "nvmlDeviceGetHandleByPciBusId_v2");
-            const auto m = (MemFn) (void*) GetProcAddress(h, "nvmlDeviceGetMemoryInfo");
-            if (init == nullptr || bus == nullptr || m == nullptr || init() != 0) return;
-            by_bus = bus;
-            mem = m;
-        }
-    };
-    static const Lib lib;
-    if (lib.mem == nullptr) return false;
-    int dev = 0;
-    cudaDeviceProp prop{};
-    if (cudaGetDevice(&dev) != cudaSuccess || cudaGetDeviceProperties(&prop, dev) != cudaSuccess) return false;
-    char bus[32];
-    std::snprintf(bus, sizeof bus, "%08X:%02X:%02X.0", (unsigned) prop.pciDomainID, (unsigned) prop.pciBusID,
-                  (unsigned) prop.pciDeviceID);
-    void* handle = nullptr;
-    Memory m{};
-    if (lib.by_bus(bus, &handle) != 0 || lib.mem(handle, &m) != 0) return false;
-    out = (size_t) m.free;
-    return true;
-}
-
-}  // namespace
-#endif
-
-namespace {
-// STRATA_EXPERT_NIBBLE: a write into a sealed cache (see ExpertCache::seal).  Says which call and stops: the slots hold
-// 4-bit codes the GGUF bytes would overwrite, or a GGUF expert where a 4-bit one is expected - a wrong reply, not an error.
-[[noreturn]] void sealed_write(const char* call, int32_t slot) {
-    std::fprintf(stderr, "strata: STRATA_EXPERT_NIBBLE: ExpertCache::%s(slot %d) after the cache was sealed - a GGUF "
-                         "blob would be written into the 4-bit expert slots: stopping\n", call, (int) slot);
-    std::fflush(stderr);
-    std::abort();
-}
-}  // namespace
 
 // See the header.  NVIDIA's DGX Spark Porting Guide (section 5.5, "Memory reporting on UMA systems") recommends the same:
 // not to rely on cudaMemGetInfo alone but to count the memory the OS can reclaim.  Swap is not counted here (unlike
 // NVIDIA's reference snippet): an expert cache that pushes the system into swap would be far slower than a smaller one.
 size_t device_free_bytes() {
     size_t free_b = 0, total_b = 0;
-    if (const cudaError_t e = cudaMemGetInfo(&free_b, &total_b); e != cudaSuccess) {
-        // #5708: a failed query is not a full card.  It still counts as nothing free (the callers size from it), but the
-        // engine says why, once per kind of error, so a "0.00 GiB free" after it is not read as a measurement; the error
-        // is taken off the thread's last-error state so a later check does not report it as its own.
-        free_b = 0;
-        (void) cudaGetLastError();
-        static std::atomic<int> said{(int) cudaSuccess};
-        if (said.exchange((int) e) != (int) e)
-            // the error's text and number: cudaGetErrorName is not in every build's runtime layer (the Mac's
-            // metal_compat, the HIP shim)
-            std::fprintf(stderr, "strata: the free graphics memory could not be read (%s, error %d); the expert cache "
-                                 "counts it as none free, so it may start with no GPU slots. If this repeats, restart "
-                                 "the computer.\n", cudaGetErrorString(e), (int) e);
-    }
+    cudaMemGetInfo(&free_b, &total_b);
 #if defined(__linux__) && !defined(STRATA_HIP_GFX906)   // (the gfx906 compat layer has no cudaDevAttrIntegrated; that GPU is discrete)
     // per device: a box can mix an integrated GPU (an APU) with a discrete one, and the answer is the CURRENT device's
     static std::atomic<int> uma_cache[64];   // 0 unknown, 1 integrated (unified memory), 2 discrete
@@ -148,27 +58,6 @@ size_t device_free_bytes() {
             const unsigned long long avail = kb << 10;
             if (avail > head && avail - head > free_b) free_b = (size_t) (avail - head);
         }
-    }
-#endif
-#if defined(STRATA_EC_NVML_FREE)
-    static const bool device_wide = [] {
-        const char* v = std::getenv("STRATA_VRAM_FREE");
-        return v != nullptr && std::strcmp(v, "device") == 0;
-    }();
-    if (device_wide) {
-        size_t nvml_b = 0;
-        const bool got = nvml_device_free(nvml_b);
-        static std::atomic<bool> said{false};
-        if (!said.exchange(true)) {
-            if (got)
-                std::fprintf(stderr, "strata generate: STRATA_VRAM_FREE=device: free VRAM is read for the whole card "
-                                     "(NVML: %lld MiB now; CUDA's figure for this process alone: %lld MiB)\n",
-                             (long long) (nvml_b >> 20), (long long) (free_b >> 20));
-            else
-                std::fprintf(stderr, "strata generate: STRATA_VRAM_FREE=device: NVML did not answer (nvml.dll); free "
-                                     "VRAM stays CUDA's figure for this process\n");
-        }
-        if (got) free_b = std::min(free_b, nvml_b);
     }
 #endif
     return free_b;
@@ -320,125 +209,24 @@ namespace ec_test {   // strata/core/expert_cache_refuse.hpp: tests only, null i
 bool (*refuse_segment_call)(const char* call, int64_t seg) = nullptr;
 }  // namespace ec_test
 
-// ---- #533: the segmented arena (--vram-elastic).  The driver API's virtual memory functions, looked up through the
-// runtime (no link against the driver library): one address range for the whole arena, backed by physical segments,
-// and the tail's segments unmapped / mapped again later.  Nothing here runs unless a segment size was set.
-#if !defined(STRATA_EC_NO_VMM)
-namespace {
-struct Vmm {
-    CUresult (CUDAAPI* device_get)(CUdevice*, int) = nullptr;
-    CUresult (CUDAAPI* attribute)(int*, CUdevice_attribute, CUdevice) = nullptr;
-    CUresult (CUDAAPI* granularity)(size_t*, const CUmemAllocationProp*, CUmemAllocationGranularity_flags) = nullptr;
-    CUresult (CUDAAPI* reserve)(CUdeviceptr*, size_t, size_t, CUdeviceptr, unsigned long long) = nullptr;
-    CUresult (CUDAAPI* address_free)(CUdeviceptr, size_t) = nullptr;
-    CUresult (CUDAAPI* create)(CUmemGenericAllocationHandle*, size_t, const CUmemAllocationProp*,
-                               unsigned long long) = nullptr;
-    CUresult (CUDAAPI* release)(CUmemGenericAllocationHandle) = nullptr;
-    CUresult (CUDAAPI* map)(CUdeviceptr, size_t, size_t, CUmemGenericAllocationHandle, unsigned long long) = nullptr;
-    CUresult (CUDAAPI* unmap)(CUdeviceptr, size_t) = nullptr;
-    CUresult (CUDAAPI* set_access)(CUdeviceptr, size_t, const CUmemAccessDesc*, size_t) = nullptr;
-    bool ok = false;
-};
-
-template <class F> bool entry(const char* name, F& f) {
-    void* p = nullptr;
-    cudaDriverEntryPointQueryResult q{};
-#if CUDART_VERSION >= 12050
-    const cudaError_t e = cudaGetDriverEntryPointByVersion(name, &p, 12000, cudaEnableDefault, &q);
-#else
-    const cudaError_t e = cudaGetDriverEntryPoint(name, &p, cudaEnableDefault, &q);
-#endif
-    if (e != cudaSuccess || q != cudaDriverEntryPointSuccess || p == nullptr) {
-        (void) cudaGetLastError();
-        return false;
-    }
-    f = reinterpret_cast<F>(p);
-    return true;
-}
-
-const Vmm& vmm() {
-    static const Vmm v = [] {
-        Vmm x;
-        x.ok = entry("cuDeviceGet", x.device_get) && entry("cuDeviceGetAttribute", x.attribute) &&
-               entry("cuMemGetAllocationGranularity", x.granularity) && entry("cuMemAddressReserve", x.reserve) &&
-               entry("cuMemAddressFree", x.address_free) && entry("cuMemCreate", x.create) &&
-               entry("cuMemRelease", x.release) && entry("cuMemMap", x.map) && entry("cuMemUnmap", x.unmap) &&
-               entry("cuMemSetAccess", x.set_access);
-        return x;
-    }();
-    return v;
-}
-
-CUmemAllocationProp device_prop(int dev) {
-    CUmemAllocationProp prop{};
-    prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
-    prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = dev;
-    return prop;
-}
-
-// one segment: a physical allocation mapped at `va`, readable and writable by this device
-bool map_segment(const Vmm& v, int dev, CUdeviceptr va, size_t bytes, unsigned long long& handle) {
-    const CUmemAllocationProp prop = device_prop(dev);
-    CUmemGenericAllocationHandle h = 0;
-    if (v.create(&h, bytes, &prop, 0) != CUDA_SUCCESS) return false;
-    if (v.map(va, bytes, 0, h, 0) != CUDA_SUCCESS) {
-        v.release(h);
-        return false;
-    }
-    CUmemAccessDesc access{};
-    access.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    access.location.id = dev;
-    access.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
-    if (v.set_access(va, bytes, &access, 1) != CUDA_SUCCESS) {
-        v.unmap(va, bytes);
-        v.release(h);
-        return false;
-    }
-    handle = (unsigned long long) h;
-    return true;
-}
-}  // namespace
-#endif
-
-#if !defined(STRATA_EC_NO_VMM)
-// the driver and this GPU offer the virtual memory functions the segmented arena needs (the check open_segmented makes first)
-static bool segmented_supported() {
-    const Vmm& v = vmm();
-    int dev = 0, supported = 0;
-    CUdevice cu = 0;
-    return v.ok && cudaGetDevice(&dev) == cudaSuccess && v.device_get(&cu, dev) == CUDA_SUCCESS &&
-           v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) == CUDA_SUCCESS && supported;
-}
-#endif
+// ---- #533: the segmented arena (--vram-elastic).  The driver's virtual memory (vmm.hpp): one address range for the
+// whole arena, backed by physical segments, and the tail's segments unmapped / mapped again later.  Nothing here runs
+// unless a segment size was set.
 
 bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
-#if defined(STRATA_EC_NO_VMM)
-    (void) want;
-    err = "ExpertCache: --vram-elastic (a segmented expert cache) is CUDA-only for now";
-    return false;
-#else
-    const Vmm& v = vmm();
-    int dev = 0, supported = 0;
-    CUdevice cu = 0;
-    if (!v.ok || cudaGetDevice(&dev) != cudaSuccess || v.device_get(&cu, dev) != CUDA_SUCCESS ||
-        v.attribute(&supported, CU_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED, cu) != CUDA_SUCCESS ||
-        !supported) {
-        err = "ExpertCache: --vram-elastic needs the driver's virtual memory management, which this GPU or driver "
-              "does not offer";
+    if (!vmm_device_supported()) {
+        err = "ExpertCache: --vram-elastic needs the driver's virtual memory management: " + vmm_off_reason();
         return false;
     }
-    const CUmemAllocationProp prop = device_prop(dev);
-    size_t gran = 0;
-    if (v.granularity(&gran, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED) != CUDA_SUCCESS || gran == 0) {
+    const uint64_t g = vmm_segment_granularity();
+    if (g == 0) {
         err = "ExpertCache: cannot read the driver's allocation granularity";
         return false;
     }
-    const uint64_t g = (uint64_t) gran;
     const uint64_t total = (want + g - 1) / g * g;
     seg_ = (int64_t) (((uint64_t) seg_req_ + g - 1) / g * g);
-    CUdeviceptr va = 0;
-    if (v.reserve(&va, (size_t) total, 0, 0, 0) != CUDA_SUCCESS) {
+    const uintptr_t va = vmm_reserve(total);
+    if (va == 0) {
         err = "ExpertCache: cannot reserve the address range of the segmented expert cache";
         return false;
     }
@@ -449,8 +237,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
         seg_size_.push_back((int64_t) std::min<uint64_t>((uint64_t) seg_, total - at));
     }
     for (size_t i = 0; i < segs_.size(); ++i) {
-        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
+        if (!vmm_segment_map(va + (uintptr_t) ((uint64_t) i * (uint64_t) seg_), (uint64_t) seg_size_[i], segs_[i])) {
             char buf[200];
             std::snprintf(buf, sizeof buf, "ExpertCache: cudaMalloc failed: segment %zu of %zu (%.2f GiB) of the "
                           "segmented cache could not be allocated", i + 1, segs_.size(),
@@ -462,22 +249,19 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
         mapped_segs_ = (int64_t) i + 1;
     }
     return true;
-#endif
 }
 
 void ExpertCache::release_segmented() {
-#if !defined(STRATA_EC_NO_VMM)
-    const Vmm& v = vmm();
     if (base_ != nullptr) cudaDeviceSynchronize();
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
-            // a handle past mapped_segs_ is one a shrink unmapped and the driver did not take back: released only
-            if (i < (size_t) mapped_segs_) v.unmap(va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i]);
-            v.release((CUmemGenericAllocationHandle) segs_[i]);
+            // a handle past mapped_segs_ is one a shrink unmapped and the driver did not take back: it is not mapped
+            if (i < (size_t) mapped_segs_)
+                (void) vmm_segment_unmap(va + (uintptr_t) ((uint64_t) i * (uint64_t) seg_), (uint64_t) seg_size_[i]);
+            (void) vmm_segment_release(segs_[i]);
         }
-    if (base_ != nullptr && reserved_ > 0) v.address_free(va, (size_t) reserved_);
-#endif
+    if (base_ != nullptr && reserved_ > 0) vmm_address_free(va, (uint64_t) reserved_);
     segs_.clear();
     seg_size_.clear();
     mapped_segs_ = 0;
@@ -505,11 +289,6 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
-#if defined(STRATA_EC_NO_VMM)
-    (void) keep_bytes;
-    return false;
-#else
-    const Vmm& v = vmm();
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
@@ -517,19 +296,19 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
     auto refused = [](const char* call, int64_t seg) {
         return ec_test::refuse_segment_call != nullptr && ec_test::refuse_segment_call(call, seg);
     };
     for (int64_t i = mapped_segs_ - 1; i >= keep; --i) {
-        const CUdeviceptr p = va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_);
-        if (refused("unmap", i) || v.unmap(p, (size_t) seg_size_[(size_t) i]) != CUDA_SUCCESS) {
+        const uintptr_t p = va + (uintptr_t) ((uint64_t) i * (uint64_t) seg_);
+        if (refused("unmap", i) || !vmm_segment_unmap(p, (uint64_t) seg_size_[(size_t) i])) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());   // segment i is still mapped: [0, i] stay
             return false;
         }
         mapped_segs_ = i;   // unmapped: its slots are gone, whether or not the driver takes the handle back
-        if (refused("release", i) || v.release((CUmemGenericAllocationHandle) segs_[(size_t) i]) != CUDA_SUCCESS) {
+        if (refused("release", i) || !vmm_segment_release(segs_[(size_t) i])) {
             err = "the driver refused to release an expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());   // the handle stays in segs_[i]: grow and close release it again
             return false;
@@ -538,7 +317,6 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     }
     live_slots_ = slots_within(mapped_bytes());
     return true;
-#endif
 }
 
 bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
@@ -546,27 +324,19 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
         err = "the expert cache is not segmented (the engine needs --vram-elastic)";
         return false;
     }
-#if defined(STRATA_EC_NO_VMM)
-    (void) want_bytes;
-    return false;
-#else
-    const Vmm& v = vmm();
-    int dev = 0;
-    cudaGetDevice(&dev);
-    const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
+    const uintptr_t va = reinterpret_cast<uintptr_t>(base_);
     int64_t at = mapped_bytes();
     while (mapped_segs_ < (int64_t) segs_.size() && at + seg_size_[(size_t) mapped_segs_] <= want_bytes) {
         const size_t i = (size_t) mapped_segs_;
         if (segs_[i] != 0) {   // a shrink unmapped this segment and the driver kept its handle then: it goes back first
-            if (v.release((CUmemGenericAllocationHandle) segs_[i]) != CUDA_SUCCESS) {
+            if (!vmm_segment_release(segs_[i])) {
                 err = "the driver has no VRAM for another expert-cache segment";
                 live_slots_ = slots_within(mapped_bytes());
                 return false;
             }
             segs_[i] = 0;
         }
-        if (!map_segment(v, dev, va + (CUdeviceptr) ((uint64_t) i * (uint64_t) seg_), (size_t) seg_size_[i],
-                         segs_[i])) {
+        if (!vmm_segment_map(va + (uintptr_t) ((uint64_t) i * (uint64_t) seg_), (uint64_t) seg_size_[i], segs_[i])) {
             (void) cudaGetLastError();
             err = "the driver has no VRAM for another expert-cache segment";
             live_slots_ = slots_within(mapped_bytes());
@@ -577,7 +347,6 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
     }
     live_slots_ = slots_within(mapped_bytes());
     return true;
-#endif
 }
 
 #if defined(STRATA_USE_HIP)
@@ -638,13 +407,6 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
         }
     }
 
-#if !defined(STRATA_EC_NO_VMM)
-    if (seg_req_ > 0 && !segmented_supported()) {   // a driver without them: one block, the engine starts all the same
-        std::fprintf(stderr, "ExpertCache: --vram-elastic is off: the driver or this GPU offers no virtual memory management; "
-                             "the cache is one block\n");
-        seg_req_ = 0;
-    }
-#endif
     if (seg_req_ > 0) {   // #533: --vram-elastic: physical segments behind one address range (zeroed below)
         if (!open_segmented(want, err)) return false;
     } else if (g_cache_vmm && vmm_available()) {
@@ -762,7 +524,6 @@ void ExpertCache::close() {
     next_free_ = 0;
     fills_ = 0;
     admitted_ = 0;
-    sealed_ = false;
     layer_next_.clear();
 }
 
@@ -783,7 +544,6 @@ int32_t ExpertCache::slot_of(int64_t layer, int64_t expert) const {
 }
 
 int32_t ExpertCache::admit(int64_t layer, int64_t expert) {
-    if (sealed_) return kNotResident;   // STRATA_EXPERT_NIBBLE: nothing is admitted (and so filled) after the startup fill
     if (layer < 0 || layer >= n_layers_ || expert < 0 || expert >= n_expert_) return kNotResident;
     const size_t at = (size_t) (layer * n_expert_ + expert);
     if (residency_[at] != kNotResident) return residency_[at];
@@ -816,7 +576,6 @@ const uint8_t* ExpertCache::device_slot(int32_t slot) const {
 }
 
 bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream, std::string& err, int64_t bytes) {
-    if (sealed_) sealed_write("fill_slot", slot);
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -839,7 +598,6 @@ bool ExpertCache::fill_slot(int32_t slot, const uint8_t* host_blob, void* stream
 }
 
 bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    if (sealed_) sealed_write("fill_slot_blocking", slot);
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr) {
@@ -871,7 +629,6 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
 }
 
 bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::string& err, int64_t bytes) {
-    if (sealed_) sealed_write("fill_slot_queued", slot);
     const size_t n = (size_t) (bytes > 0 && bytes <= blob_ ? bytes : blob_);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || host_blob == nullptr) {
@@ -889,7 +646,6 @@ bool ExpertCache::fill_slot_queued(int32_t slot, const uint8_t* host_blob, std::
 }
 
 bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, int n, std::string& err) {
-    if (sealed_) sealed_write("fill_slot_queued_parts", slot);
     uint8_t* dst = device_slot(slot);
     if (dst == nullptr || parts == nullptr || n <= 0) {
         err = "ExpertCache::fill_slot_queued_parts: slot outside the arena or no pieces";
