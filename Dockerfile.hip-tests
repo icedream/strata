@@ -1,0 +1,101 @@
+# syntax=docker/dockerfile:1
+#
+# Test-only HIP build for PR #2398 (HIP virtual memory behind a start-up check).
+#
+# It compiles the engine library plus the two unit tests that carry the PR's gate:
+#
+#   vmm_test                        - the per-device check: recommended allocation
+#                                     granularity, the 32 MiB map/release probe that has to
+#                                     move hipMemGetInfo down and back up, and the Linux
+#                                     open-file count for the whole card.
+#   expert_cache_segmented_test     - the segmented arena actually giving VRAM back.
+#
+# Both SKIP (exit 77) rather than fail when the runtime is turned off, and the skip prints
+# vmm_off_reason() - which is the number we want on an untested card.
+#
+# Base image, apt set and cmake argument list are the same as Dockerfile.hip, so the HIP
+# runtime under test is the one production runs on. Not a runtime image.
+#
+#   docker build -f Dockerfile.hip-tests -t strata:hip-tests .
+#   docker run --rm --device /dev/kfd --device /dev/dri --ulimit memlock=-1 \
+#     strata:hip-tests /opt/strata/build-tests/vmm_test
+
+ARG ROCM_VERSION=7.2.4
+FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
+
+ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential ca-certificates curl git libatomic1 libgomp1 \
+        ninja-build pkg-config \
+        python3 python3-pip python3-venv unzip
+# rocm/dev-ubuntu-24.04:<x>-complete/-full already carry hipBLAS, hipBLASLt, their headers and
+# hip-lang's CMake config; the plain tag carries none of them. Only add the -dev packages when
+# something is missing - on 7.14.1-full those package names are not in its repo at all.
+RUN if ! (ls /opt/rocm/lib/libhipblas.so* >/dev/null 2>&1 \
+           && test -f /opt/rocm/include/hipblaslt/hipblaslt-version.h \
+           && test -f /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake); then \
+        apt-get install -y --no-install-recommends hipblas-dev hipblaslt-dev; \
+    fi \
+    && rm -rf /var/lib/apt/lists/* \
+    && ls /opt/rocm/lib/libhipblas.so* >/dev/null \
+       && test -f /opt/rocm/include/hipblaslt/hipblaslt-version.h \
+       && test -f /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake \
+       || { echo "ERROR: the base image lacks the HIP BLAS development files setup.rocm_root() needs"; exit 1; }
+
+WORKDIR /opt/strata
+COPY . .
+
+# The architecture must be given, not read from the card: docker build has no GPU.
+ARG HIP_ARCHITECTURES=gfx1100
+
+RUN python3 -m venv .venv \
+    && .venv/bin/pip install --no-cache-dir --upgrade pip \
+    && .venv/bin/pip install --no-cache-dir -r requirements.txt
+
+# Same guard as Dockerfile.hip: setup.rocm_root() falls back to AMD's TheRock wheels when the
+# system ROCm lacks something, and those wheels are a different HIP runtime - which is exactly
+# the variable this test is about, so a silent switch would make the result meaningless.
+RUN HIP_ARCHITECTURES="$HIP_ARCHITECTURES" .venv/bin/python - <<'PYEOF'
+import os, setup
+
+archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1100").replace(",", ";").split(";") if a]
+root, dirs = setup.rocm_root(archs)
+print("HIP runtime under test:", root, dirs)
+if str(root) != "/opt/rocm":
+    raise SystemExit(
+        f"ERROR: setup.py chose {root} (TheRock wheels) over the system ROCm; the whole point "
+        "here is to measure the runtime production uses.")
+PYEOF
+
+# build_engine_hip's own cmake argument list (setup.py:3002-3008) with STRATA_BUILD_TESTS=ON,
+# then only the two test targets. cmake_build() is used rather than a bare cmake: setup.py
+# installs cmake and ninja into .venv (requirements.txt) and resolves them with find_tool(),
+# and the base image has neither on PATH.
+RUN HIP_ARCHITECTURES="$HIP_ARCHITECTURES" .venv/bin/python - <<'PYEOF'
+import os, setup
+
+archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1100").replace(",", ";").split(";") if a]
+root, libs = setup.rocm_root(archs)
+bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode")
+                if p.is_dir()), root / "amdgcn" / "bitcode")
+os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr",
+                   "ROCM_PATH": str(root), "HIP_PATH": str(root)})
+llama = setup.get_llama_cpp()
+
+defs = ["-DSTRATA_ENABLE_HIP=ON", "-DSTRATA_ENABLE_CUDA=OFF", "-DSTRATA_BUILD_TESTS=ON",
+        "-DSTRATA_PREFILL_MMQ=ON", "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+        f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+        f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+        "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+        f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}",
+        f"-DSTRATA_GGML_DIR={llama}"]
+for target in ("vmm_test", "expert_cache_segmented_test", "tune_hipblaslt"):
+    setup.cmake_build(setup.ROOT, setup.ROOT / "build-tests", target, defs, None, "")
+PYEOF
+
+RUN ls -l build-tests/vmm_test build-tests/expert_cache_segmented_test build-tests/tune_hipblaslt
+
+ENTRYPOINT []
+CMD ["/opt/strata/build-tests/vmm_test"]
