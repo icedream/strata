@@ -30,9 +30,11 @@
 # (AVX-512 on a Ryzen 7950X), so this image is not portable to other CPUs. The entry point
 # warns when the host CPU lacks AVX2.
 #
-# BUILD_VISION is "none", "cpu" or "gpu". setup.py only offers the CPU encoder on AMD ("there
-# is no HIP encoder build yet"), so "gpu" is built here directly: llama.cpp's HIP backend
-# compiles the ggml-cuda sources, and mtmd is backend-agnostic. See the build step below.
+# BUILD_VISION is "none", "cpu" or "gpu". On 0.2.2 setup.py builds the HIP picture reader itself
+# (build_engine_hip -> build_vision_hip, setup.py:4431): it compiles tools/vision with
+# -DSTRATA_VISION_HIP=ON -DSTRATA_VISION_HIP_ARCHS=... and installs it as strata-vision-hip,
+# stamping BUILD.json with "vision": "gpu", "vision_gpu": "strata-vision-hip". On 0.1.44.1 that
+# step did not exist and this file built it by hand - see 0.1.44.1+icedream.1.
 
 ARG ROCM_VERSION=7.2.4
 FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
@@ -126,47 +128,27 @@ PYEOF
 # The HIP build links the MMQ/K-quant kernels statically (libstrata_mmq.a,
 # libstrata_prefill.a), so unlike the CUDA path there is no libstrata_kq.so to copy.
 #
-# BUILD_VISION=gpu is the image encoder on the GPU, which setup.py does not offer on AMD
-# ("there is no HIP encoder build yet", setup.py:2969). It needs no patch to
-# tools/vision/CMakeLists.txt: that file only forces GGML_CUDA, so -DGGML_HIP=ON reaches
-# llama.cpp directly, and llama.cpp's HIP backend compiles the ggml-cuda sources and defines
-# GGML_USE_CUDA (ggml-hip/CMakeLists.txt:63,83,86). mtmd has no CUDA-specific code at all, so
-# it runs on whichever ggml backend is live, and tools/vision/strata_vision.cpp already
-# implements --gpu / cp.use_gpu. The cmake argument list is the one build_engine_hip uses.
+# BUILD_VISION=gpu is the picture reader on the GPU. From 0.2.2 that is setup.py's own path
+# (build_vision_hip, setup.py:4431): it names the program strata-vision-hip, needs
+# STRATA_VISION_HIP_ARCHS, and refuses STRATA_VISION_CUDA next to STRATA_VISION_HIP
+# (tools/vision/CMakeLists.txt:22,28) - the two are different programs now.
 RUN HIP_ARCHITECTURES="$HIP_ARCHITECTURES" BUILD_VISION="$BUILD_VISION" .venv/bin/python - <<'PYEOF'
-import json, os, shutil, setup
+import os, setup
 
 archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1100").replace(",", ";").split(";") if a]
 vision = os.environ.get("BUILD_VISION", "none")
 assert vision in ("none", "cpu", "gpu"), "BUILD_VISION on AMD is none, cpu or gpu"
 
-llama = setup.get_llama_cpp()
-gpu = {"arch": archs[0], "archs": archs}
-# build_engine_hip only knows the CPU encoder, so ask it for that one and do the GPU one here.
-setup.build_engine_hip(gpu, llama, vision=("cpu" if vision == "cpu" else "none"))
-
-if vision == "gpu":
-    root, libs = setup.rocm_root(archs)
-    bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode")
-                    if p.is_dir()), root / "amdgcn" / "bitcode")
-    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
-    os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr",
-                       "ROCM_PATH": str(root), "HIP_PATH": str(root)})
-    defs = [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DGGML_HIP=ON", "-DSTRATA_PORTABLE=OFF",
-            "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
-            f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
-            f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
-            "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
-            f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"]
-    setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-hip", "strata-vision",
-                      defs, None, "")
-    shutil.copy2(setup.ROOT / "build-vision-hip" / "bin" / setup.VEXE, setup.ROOT / "engine" / setup.VEXE)
-    stamp, meta = setup.ROOT / "engine" / "BUILD.json", json.loads((setup.ROOT / "engine" / "BUILD.json").read_text())
-    meta["vision"] = "hip"
-    stamp.write_text(json.dumps(meta, indent=1))
+setup.build_engine_hip({"arch": archs[0], "archs": archs}, setup.get_llama_cpp(), vision=vision)
 PYEOF
 
-RUN test -x engine/strata-vision && ldd engine/strata-vision | grep -c "hip\|rocblas" && cat engine/BUILD.json
+# the encoder that has to be there depends on BUILD_VISION; a silent CPU fallback is what bit the
+# 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round).
+RUN if [ "$BUILD_VISION" = "gpu" ]; then \
+        test -x engine/strata-vision-hip && ldd engine/strata-vision-hip | grep -c "hip\|rocblas"; \
+    else \
+        test -x engine/strata-vision; \
+    fi && cat engine/BUILD.json
 
 # the cmake trees are build-time only; the engine itself is what the container needs
 RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata && cat engine/BUILD.json
@@ -192,4 +174,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+# Upstream's docker/entrypoint.sh is not used: it plans and tunes a model through `strata launch`
+# and lists CONFIG / HOST as legacy env vars it ignores. This image names one finished config, so
+# it starts serve/server.py directly (see docker-entrypoint-serve.sh).
+ENTRYPOINT ["./docker-entrypoint-serve.sh"]
