@@ -30,8 +30,9 @@
 # (AVX-512 on a Ryzen 7950X), so this image is not portable to other CPUs. The entry point
 # warns when the host CPU lacks AVX2.
 #
-# There is no HIP image encoder yet (setup.py's build_engine_hip says so), so BUILD_VISION
-# is "none" or "cpu" here; "cpu" builds the CPU encoder from tools/vision without CUDA.
+# BUILD_VISION is "none", "cpu" or "gpu". setup.py only offers the CPU encoder on AMD ("there
+# is no HIP encoder build yet"), so "gpu" is built here directly: llama.cpp's HIP backend
+# compiles the ggml-cuda sources, and mtmd is backend-agnostic. See the build step below.
 
 ARG ROCM_VERSION=7.2.4
 FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
@@ -43,10 +44,17 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git libatomic1 libgomp1 \
         ninja-build pkg-config \
-        python3 python3-pip python3-venv unzip \
-        hipblas-dev hipblaslt-dev \
+        python3 python3-pip python3-venv unzip
+# rocm/dev-ubuntu-24.04:<x>-complete/-full already carry hipBLAS, hipBLASLt, their headers and
+# hip-lang's CMake config; the plain tag carries none of them. Only add the -dev packages when
+# something is missing - on 7.14.1-full those package names are not in its repo at all.
+RUN if ! (ls /opt/rocm/lib/libhipblas.so* >/dev/null 2>&1 \
+           && test -f /opt/rocm/include/hipblaslt/hipblaslt-version.h \
+           && test -f /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake); then \
+        apt-get install -y --no-install-recommends hipblas-dev hipblaslt-dev; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
-# rocm/dev-ubuntu-24.04 is the HIP/LLVM dev image: hipcc, hip-dev (hip-lang's CMake config) and
+# rocm/dev-ubuntu-24.04 (the plain tag) is the HIP/LLVM dev image: hipcc, hip-dev (hip-lang's CMake config) and
 # rocm-llvm, but NO BLAS at all. setup.py's rocm_root() needs libhipblas.so in the system ROCm or
 # it silently falls back to AMD's TheRock wheels in .venv - a different hipBLASLt and ~10 GB of
 # downloads. hipblas-dev pulls hipblas 3.2.0 + rocblas 5.2.0, and hipblaslt-dev gives hipBLASLt
@@ -117,20 +125,51 @@ PYEOF
 # is what makes the first container start reuse the engine instead of recompiling it.
 # The HIP build links the MMQ/K-quant kernels statically (libstrata_mmq.a,
 # libstrata_prefill.a), so unlike the CUDA path there is no libstrata_kq.so to copy.
+#
+# BUILD_VISION=gpu is the image encoder on the GPU, which setup.py does not offer on AMD
+# ("there is no HIP encoder build yet", setup.py:2969). It needs no patch to
+# tools/vision/CMakeLists.txt: that file only forces GGML_CUDA, so -DGGML_HIP=ON reaches
+# llama.cpp directly, and llama.cpp's HIP backend compiles the ggml-cuda sources and defines
+# GGML_USE_CUDA (ggml-hip/CMakeLists.txt:63,83,86). mtmd has no CUDA-specific code at all, so
+# it runs on whichever ggml backend is live, and tools/vision/strata_vision.cpp already
+# implements --gpu / cp.use_gpu. The cmake argument list is the one build_engine_hip uses.
 RUN HIP_ARCHITECTURES="$HIP_ARCHITECTURES" BUILD_VISION="$BUILD_VISION" .venv/bin/python - <<'PYEOF'
-import os, setup
+import json, os, shutil, setup
 
 archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1100").replace(",", ";").split(";") if a]
 vision = os.environ.get("BUILD_VISION", "none")
-assert vision in ("none", "cpu"), "BUILD_VISION on AMD is none or cpu (no HIP encoder yet)"
+assert vision in ("none", "cpu", "gpu"), "BUILD_VISION on AMD is none, cpu or gpu"
 
 llama = setup.get_llama_cpp()
 gpu = {"arch": archs[0], "archs": archs}
-setup.build_engine_hip(gpu, llama, vision=vision)
+# build_engine_hip only knows the CPU encoder, so ask it for that one and do the GPU one here.
+setup.build_engine_hip(gpu, llama, vision=("cpu" if vision == "cpu" else "none"))
+
+if vision == "gpu":
+    root, libs = setup.rocm_root(archs)
+    bitcode = next((p for p in (root / "lib" / "llvm" / "amdgcn" / "bitcode", root / "amdgcn" / "bitcode")
+                    if p.is_dir()), root / "amdgcn" / "bitcode")
+    os.environ["PATH"] = os.pathsep.join([str(root / "bin"), str(root / "llvm" / "bin"), os.environ.get("PATH", "")])
+    os.environ.update({"HIP_PLATFORM": "amd", "HIP_COMPILER": "clang", "HIP_RUNTIME": "rocclr",
+                       "ROCM_PATH": str(root), "HIP_PATH": str(root)})
+    defs = [f"-DLLAMA_DIR={llama}", "-DSTRATA_VISION_CUDA=OFF", "-DGGML_HIP=ON", "-DSTRATA_PORTABLE=OFF",
+            "-DCMAKE_HIP_ARCHITECTURES=" + ";".join(archs),
+            f"-DCMAKE_HIP_COMPILER={root / 'llvm' / 'bin' / 'clang++'}",
+            f"-DCMAKE_HIP_COMPILER_ROCM_ROOT={root}",
+            "-DCMAKE_PREFIX_PATH=" + ";".join([str(root), *libs]),
+            f"-DCMAKE_HIP_FLAGS=--rocm-path={root} --rocm-device-lib-path={bitcode}"]
+    setup.cmake_build(setup.ROOT / "tools" / "vision", setup.ROOT / "build-vision-hip", "strata-vision",
+                      defs, None, "")
+    shutil.copy2(setup.ROOT / "build-vision-hip" / "bin" / setup.VEXE, setup.ROOT / "engine" / setup.VEXE)
+    stamp, meta = setup.ROOT / "engine" / "BUILD.json", json.loads((setup.ROOT / "engine" / "BUILD.json").read_text())
+    meta["vision"] = "hip"
+    stamp.write_text(json.dumps(meta, indent=1))
 PYEOF
 
+RUN test -x engine/strata-vision && ldd engine/strata-vision | grep -c "hip\|rocblas" && cat engine/BUILD.json
+
 # the cmake trees are build-time only; the engine itself is what the container needs
-RUN rm -rf build-hip build-vision build && test -x engine/strata && cat engine/BUILD.json
+RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata && cat engine/BUILD.json
 
 # Run as the host user (compose passes user: ${UID}:${GID}) so the bind-mounted model tree
 # is writable and the container is not root. /opt/strata is written to at start (the config
