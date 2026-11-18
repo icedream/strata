@@ -15,7 +15,7 @@ MTP head, the CUDA context and the prompt buffers stay, so Strata never gives ba
 
 The engine switches the feature off at start, with one line in its log (`--vram-elastic is off: ...`), when it is not
 a `--serve` engine, with a layer split, with helper caches on other GPUs, with a segment below 64 MiB, and on HIP
-(NVIDIA only). If the driver offers no virtual memory management the cache is one block and the engine starts all the same
+(NVIDIA only upstream; this fork carries the HIP path, see PATCHES.md). If the driver offers no virtual memory management the cache is one block and the engine starts all the same
 (`--vram-elastic is off: the driver or this GPU offers no virtual memory management`) **(code; not run on such a driver)**.
 Without the flag nothing changes: the same answers as without it.
 
@@ -115,9 +115,9 @@ number the person or the app chose is kept). A start that finds no room (the res
 starting) is read by the CPU reader, which is the same program without `--gpu`, with the same picture tokens; the next start tries the card again.
 `"elastic": false` in the config's `"vision"` section keeps the reader on the card as before; `"elastic": true` asks for it on any card the
 reader runs on. Intel and a Mac keep their readers as they were (not measured there). AMD works the same way (the HIP reader, with the CPU reader beside it) but is
-off by default: there is no shrinking expert cache on HIP, so the reader's room stays in the reserve and the experts get nothing back (Radeon AI PRO R9700, Qwen
+off by default: upstream has no shrinking expert cache on HIP, so the reader's room stays in the reserve and the experts get nothing back (Radeon AI PRO R9700, Qwen
 UD-Q4_K_XL: 7,959 slots on demand, 7,943 with the reader on the card, 8,411 with the CPU reader), and the first picture after a start takes 5 s longer (the HIP reader starts
-in 4.9 s, 1,480 MiB). It releases its VRAM when idle (30,585 to 32,098 MiB while it runs, back to 30,618 after 120 s). `"elastic": true` in the vision section asks for it. Not by default with a layer split, batch slots,
+in 4.9 s, 1,480 MiB). With this fork's HIP segmented cache the reader can borrow there too. It releases its VRAM when idle (30,585 to 32,098 MiB while it runs, back to 30,618 after 120 s). `"elastic": true` in the vision section asks for it. Not by default with a layer split, batch slots,
 `--kv-grow` or `--peer-device`.
 
 With `"vram_elastic": true` as well (opt-in) the expert cache gives the room instead of the reserve:

@@ -30,8 +30,8 @@
 # (AVX-512 on a Ryzen 7950X), so this image is not portable to other CPUs. The entry point
 # warns when the host CPU lacks AVX2.
 #
-# BUILD_VISION is "none", "cpu" or "gpu". On 0.2.2 setup.py builds the HIP picture reader itself
-# (build_engine_hip -> build_vision_hip, setup.py:4431): it compiles tools/vision with
+# BUILD_VISION is "none", "cpu" or "gpu". Since 0.2.2 setup.py builds the HIP picture reader itself
+# (build_engine_hip -> build_vision_hip): it compiles tools/vision with
 # -DSTRATA_VISION_HIP=ON -DSTRATA_VISION_HIP_ARCHS=... and installs it as strata-vision-hip,
 # stamping BUILD.json with "vision": "gpu", "vision_gpu": "strata-vision-hip". On 0.1.44.1 that
 # step did not exist and this file built it by hand - see 0.1.44.1+icedream.1.
