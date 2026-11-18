@@ -36,12 +36,19 @@
 # stamping BUILD.json with "vision": "gpu", "vision_gpu": "strata-vision-hip". On 0.1.44.1 that
 # step did not exist and this file built it by hand - see 0.1.44.1+icedream.1.
 
-# ROCM_BASE is separate from the version so the base can be taken from a registry mirror;
-# whatever host it names has to carry the tag, and the tag still has to match the hipBLASLt
-# table checked below.
-ARG ROCM_BASE=rocm/dev-ubuntu-24.04
-ARG ROCM_VERSION=7.2.4
-FROM ${ROCM_BASE}:${ROCM_VERSION}
+# ROCM_IMAGE is the whole base reference: one argument names a registry mirror and pins the
+# base by digest (`repo:tag@sha256:...`). The tag still has to match the hipBLASLt table
+# checked below.
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2.4
+FROM ${ROCM_IMAGE}
+
+# Provenance: the fork tag and the commit these bytes were built from, passed at build time.
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+LABEL org.opencontainers.image.title="Strata (HIP, gfx1100)" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.source="https://github.com/icedream/strata"
 
 # STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1 and
 # docker stop's SIGTERM reaches it (see setup.start).
@@ -105,7 +112,7 @@ RUN set -e; \
     test "$maj.$min.$pat" = "${EXPECTED_HIPBLASLT}" || \
       fail "hipBLASLt is $maj.$min.$pat but this build expects ${EXPECTED_HIPBLASLT} (the version the host's tuned config was measured with); pass --build-arg EXPECTED_HIPBLASLT=$maj.$min.$pat if the new one is intended"; \
     test -f "tools/hip/${arch}-hipblaslt-${code}.txt" || \
-      fail "no shipped hipBLASLt tuning table for $arch at $maj.$min.$pat - the tuned dense-prefill path would silently stop applying; pick a ROCM_VERSION whose hipBLASLt has a table, or add one"
+      fail "no shipped hipBLASLt tuning table for $arch at $maj.$min.$pat - the tuned dense-prefill path would silently stop applying; pick a ROCM_IMAGE whose hipBLASLt has a table, or add one"
 
 # setup.py picks ROCm itself: a system ROCm with hipcc, libhipblas.so and the HIP development
 # files, else AMD's TheRock wheels installed into .venv. The wheels are a different hipBLASLt
