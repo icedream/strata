@@ -36,8 +36,12 @@
 # stamping BUILD.json with "vision": "gpu", "vision_gpu": "strata-vision-hip". On 0.1.44.1 that
 # step did not exist and this file built it by hand - see 0.1.44.1+icedream.1.
 
+# ROCM_BASE is separate from the version so the base can be taken from a registry mirror;
+# whatever host it names has to carry the tag, and the tag still has to match the hipBLASLt
+# table checked below.
+ARG ROCM_BASE=rocm/dev-ubuntu-24.04
 ARG ROCM_VERSION=7.2.4
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
+FROM ${ROCM_BASE}:${ROCM_VERSION}
 
 # STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1 and
 # docker stop's SIGTERM reaches it (see setup.start).
