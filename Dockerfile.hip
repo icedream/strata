@@ -30,11 +30,25 @@
 # (AVX-512 on a Ryzen 7950X), so this image is not portable to other CPUs. The entry point
 # warns when the host CPU lacks AVX2.
 #
-# There is no HIP image encoder yet (setup.py's build_engine_hip says so), so BUILD_VISION
-# is "none" or "cpu" here; "cpu" builds the CPU encoder from tools/vision without CUDA.
+# BUILD_VISION is "none", "cpu" or "gpu". Since 0.2.2 setup.py builds the HIP picture reader itself
+# (build_engine_hip -> build_vision_hip): it compiles tools/vision with
+# -DSTRATA_VISION_HIP=ON -DSTRATA_VISION_HIP_ARCHS=... and installs it as strata-vision-hip,
+# stamping BUILD.json with "vision": "gpu", "vision_gpu": "strata-vision-hip". On 0.1.44.1 that
+# step did not exist and this file built it by hand - see 0.1.44.1+icedream.1.
 
-ARG ROCM_VERSION=7.2.4
-FROM rocm/dev-ubuntu-24.04:${ROCM_VERSION}
+# ROCM_IMAGE is the whole base reference: one argument names a registry mirror and pins the
+# base by digest (`repo:tag@sha256:...`). The tag still has to match the hipBLASLt table
+# checked below.
+ARG ROCM_IMAGE=rocm/dev-ubuntu-24.04:7.2.4
+FROM ${ROCM_IMAGE}
+
+# Provenance: the fork tag and the commit these bytes were built from, passed at build time.
+ARG IMAGE_VERSION=dev
+ARG IMAGE_REVISION=unknown
+LABEL org.opencontainers.image.title="Strata (HIP, gfx1100)" \
+      org.opencontainers.image.version="${IMAGE_VERSION}" \
+      org.opencontainers.image.revision="${IMAGE_REVISION}" \
+      org.opencontainers.image.source="https://github.com/icedream/strata"
 
 # STRATA_EXECV=1: setup.py replaces itself with the server, so the server is PID 1 and
 # docker stop's SIGTERM reaches it (see setup.start).
@@ -43,10 +57,17 @@ ENV DEBIAN_FRONTEND=noninteractive PYTHONUNBUFFERED=1 LANG=C.UTF-8 STRATA_EXECV=
 RUN apt-get update && apt-get install -y --no-install-recommends \
         build-essential ca-certificates curl git libatomic1 libgomp1 \
         ninja-build pkg-config \
-        python3 python3-pip python3-venv unzip \
-        hipblas-dev hipblaslt-dev \
+        python3 python3-pip python3-venv unzip
+# rocm/dev-ubuntu-24.04:<x>-complete/-full already carry hipBLAS, hipBLASLt, their headers and
+# hip-lang's CMake config; the plain tag carries none of them. Only add the -dev packages when
+# something is missing - on 7.14.1-full those package names are not in its repo at all.
+RUN if ! (ls /opt/rocm/lib/libhipblas.so* >/dev/null 2>&1 \
+           && test -f /opt/rocm/include/hipblaslt/hipblaslt-version.h \
+           && test -f /opt/rocm/lib/cmake/hip-lang/hip-lang-config.cmake); then \
+        apt-get install -y --no-install-recommends hipblas-dev hipblaslt-dev; \
+    fi \
     && rm -rf /var/lib/apt/lists/*
-# rocm/dev-ubuntu-24.04 is the HIP/LLVM dev image: hipcc, hip-dev (hip-lang's CMake config) and
+# rocm/dev-ubuntu-24.04 (the plain tag) is the HIP/LLVM dev image: hipcc, hip-dev (hip-lang's CMake config) and
 # rocm-llvm, but NO BLAS at all. setup.py's rocm_root() needs libhipblas.so in the system ROCm or
 # it silently falls back to AMD's TheRock wheels in .venv - a different hipBLASLt and ~10 GB of
 # downloads. hipblas-dev pulls hipblas 3.2.0 + rocblas 5.2.0, and hipblaslt-dev gives hipBLASLt
@@ -68,7 +89,7 @@ ARG EXPECTED_HIPBLASLT=1.2.2
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
     && .venv/bin/pip install --no-cache-dir -r requirements.txt \
-    && chmod +x setup.sh docker-entrypoint.sh
+    && chmod +x setup.sh docker-entrypoint-serve.sh
 
 # Fail loudly, naming the check that failed, on a base image whose hipBLASLt has no shipped
 # tuning table, or whose ROCm lacks the files setup.py needs (it would otherwise fall back to
@@ -91,7 +112,7 @@ RUN set -e; \
     test "$maj.$min.$pat" = "${EXPECTED_HIPBLASLT}" || \
       fail "hipBLASLt is $maj.$min.$pat but this build expects ${EXPECTED_HIPBLASLT} (the version the host's tuned config was measured with); pass --build-arg EXPECTED_HIPBLASLT=$maj.$min.$pat if the new one is intended"; \
     test -f "tools/hip/${arch}-hipblaslt-${code}.txt" || \
-      fail "no shipped hipBLASLt tuning table for $arch at $maj.$min.$pat - the tuned dense-prefill path would silently stop applying; pick a ROCM_VERSION whose hipBLASLt has a table, or add one"
+      fail "no shipped hipBLASLt tuning table for $arch at $maj.$min.$pat - the tuned dense-prefill path would silently stop applying; pick a ROCM_IMAGE whose hipBLASLt has a table, or add one"
 
 # setup.py picks ROCm itself: a system ROCm with hipcc, libhipblas.so and the HIP development
 # files, else AMD's TheRock wheels installed into .venv. The wheels are a different hipBLASLt
@@ -117,20 +138,31 @@ PYEOF
 # is what makes the first container start reuse the engine instead of recompiling it.
 # The HIP build links the MMQ/K-quant kernels statically (libstrata_mmq.a,
 # libstrata_prefill.a), so unlike the CUDA path there is no libstrata_kq.so to copy.
+#
+# BUILD_VISION=gpu is the picture reader on the GPU. From 0.2.2 that is setup.py's own path
+# (build_vision_hip, setup.py:4431): it names the program strata-vision-hip, needs
+# STRATA_VISION_HIP_ARCHS, and refuses STRATA_VISION_CUDA next to STRATA_VISION_HIP
+# (tools/vision/CMakeLists.txt:22,28) - the two are different programs now.
 RUN HIP_ARCHITECTURES="$HIP_ARCHITECTURES" BUILD_VISION="$BUILD_VISION" .venv/bin/python - <<'PYEOF'
 import os, setup
 
 archs = [a for a in os.environ.get("HIP_ARCHITECTURES", "gfx1100").replace(",", ";").split(";") if a]
 vision = os.environ.get("BUILD_VISION", "none")
-assert vision in ("none", "cpu"), "BUILD_VISION on AMD is none or cpu (no HIP encoder yet)"
+assert vision in ("none", "cpu", "gpu"), "BUILD_VISION on AMD is none, cpu or gpu"
 
-llama = setup.get_llama_cpp()
-gpu = {"arch": archs[0], "archs": archs}
-setup.build_engine_hip(gpu, llama, vision=vision)
+setup.build_engine_hip({"arch": archs[0], "archs": archs}, setup.get_llama_cpp(), vision=vision)
 PYEOF
 
+# the encoder that has to be there depends on BUILD_VISION; a silent CPU fallback is what bit the
+# 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round).
+RUN if [ "$BUILD_VISION" = "gpu" ]; then \
+        test -x engine/strata-vision-hip && ldd engine/strata-vision-hip | grep -c "hip\|rocblas"; \
+    else \
+        test -x engine/strata-vision; \
+    fi && cat engine/BUILD.json
+
 # the cmake trees are build-time only; the engine itself is what the container needs
-RUN rm -rf build-hip build-vision build && test -x engine/strata && cat engine/BUILD.json
+RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata && cat engine/BUILD.json
 
 # Run as the host user (compose passes user: ${UID}:${GID}) so the bind-mounted model tree
 # is writable and the container is not root. /opt/strata is written to at start (the config
@@ -153,4 +185,7 @@ EXPOSE 8080
 HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
   CMD curl -fs "http://127.0.0.1:${PORT:-8080}/health" || exit 1
 
-ENTRYPOINT ["./docker-entrypoint.sh"]
+# Upstream's docker/entrypoint.sh is not used: it plans and tunes a model through `strata launch`
+# and lists CONFIG / HOST as legacy env vars it ignores. This image names one finished config, so
+# it starts serve/server.py directly (see docker-entrypoint-serve.sh).
+ENTRYPOINT ["./docker-entrypoint-serve.sh"]

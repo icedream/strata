@@ -62,7 +62,7 @@ class Source(Base):
 
     def test_a_failed_download_recommends_modelscope(self):
         self.assertIn("--source modelscope", setup.source_hint(HF_URL))
-        self.assertEqual(setup.source_hint(setup.LLAMA_CPP_ZIP), "")
+        self.assertEqual(setup.source_hint("https://github.com/example/repo/archive/main.zip"), "")
 
     def test_hf_endpoint_is_a_choice(self):
         os.environ["HF_ENDPOINT"] = "https://hf-mirror.com"
@@ -75,7 +75,7 @@ class Source(Base):
         self.assertEqual(setup.ms_url(REPO, PATH),
                          "https://www.modelscope.cn/models/" + REPO + "/resolve/master/" + PATH)
         self.assertIsNone(setup.ms_file("https://huggingface.co/someone/other/resolve/main/x.gguf"))
-        self.assertIsNone(setup.ms_file(setup.LLAMA_CPP_ZIP))
+        self.assertIsNone(setup.ms_file("https://github.com/example/repo/archive/main.zip"))
 
 
 class Download(Base):
@@ -99,6 +99,11 @@ class Download(Base):
         os.environ["MODELSCOPE_ENDPOINT"] = "http://127.0.0.1:%d" % self.server.server_address[1]
         os.environ["STRATA_SOURCE"] = "modelscope"
         self.dst = Path(self.tmp.name) / "out" / Path(PATH).name
+        # a file with no pin of its own (the hash ModelScope publishes is the check); the pinned case is below
+        pins = {**setup.REPO_PINS, REPO: {k: v for k, v in setup.REPO_PINS[REPO].items() if k != Path(PATH).name}}
+        patch = mock.patch.object(setup, "REPO_PINS", pins)
+        patch.start()
+        self.addCleanup(patch.stop)
 
     def api(self, sha):
         p = self.www / "api" / "v1" / "models" / REPO / "repo" / "files"
@@ -124,10 +129,23 @@ class Download(Base):
         self.assertEqual(self.dst.read_bytes(), self.data)
         self.assertTrue(self.dst.with_name(self.dst.name + ".done").exists())
 
+    def test_the_pin_decides_over_what_modelscope_publishes(self):
+        """A pinned file is checked against its fixed SHA-256 whatever the host says: ModelScope serves current files."""
+        sha = hashlib.sha256(self.data).hexdigest()
+        self.api(sha)                                  # ModelScope vouches for its own copy ...
+        pins = {**setup.REPO_PINS, REPO: {**setup.REPO_PINS[REPO], Path(PATH).name: (len(self.data), "1" * 64)}}
+        with mock.patch.object(setup, "REPO_PINS", pins), mock.patch.object(setup, "say"),                 self.assertRaises(SystemExit):         # ... but it is not the pinned file
+            setup.download(HF_URL, self.dst)
+        self.assertFalse(self.dst.exists())
+        pins[REPO][Path(PATH).name] = (len(self.data), sha)
+        with mock.patch.object(setup, "REPO_PINS", pins):
+            setup.download(HF_URL, self.dst)
+        self.assertIn("sha256 " + sha, self.dst.with_name(self.dst.name + ".done").read_text())
+
     def test_falls_back_when_modelscope_is_silent(self):
         calls = []
         with mock.patch.object(setup, "reachable", return_value=False), \
-                mock.patch.object(setup.urllib.request, "urlopen",
+                mock.patch.object(setup.netpolicy, "urlopen",
                                   side_effect=lambda req, timeout=0: calls.append(req.full_url) or (_ for _ in ()).throw(
                                       OSError("offline"))), \
                 mock.patch.object(setup.time, "sleep"), self.assertRaises(SystemExit):
