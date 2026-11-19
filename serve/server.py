@@ -8168,11 +8168,16 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models"):
                 if self._authorized():
+                    import serve.frontend as _frontend            # the family's own effort table, as set_family picks it
                     loaded = svc.loaded()
                     model = {"id": svc.model, "object": "model", "status": {"value": "loaded"},
                              "meta": {"n_ctx": svc.reported_ctx()},
                              "architecture": {"input_modalities": ["text", "image"] if svc.vision is not None else ["text"],
                                               "output_modalities": ["text"]}}
+                    levels = _frontend.reasoning_levels()          # the thinking levels this model answers, from its table
+                    if levels:
+                        model["capabilities"] = ["reasoning"]
+                        model["params"] = {"reasoning": {"supported": levels}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True
