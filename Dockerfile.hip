@@ -90,6 +90,9 @@ RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
     && .venv/bin/pip install --no-cache-dir -r terminal/requirements.txt \
     && chmod +x setup.sh docker-entrypoint-serve.sh
+# 0.2.20 moved the Python entry points into terminal/: setup.py is what builds the engine here,
+# and serve/server.py is what the container runs, so the package root is that directory.
+ENV PYTHONPATH=/opt/strata/terminal
 
 # Fail loudly, naming the check that failed, on a base image whose hipBLASLt has no shipped
 # tuning table, or whose ROCm lacks the files setup.py needs (it would otherwise fall back to
