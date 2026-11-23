@@ -88,7 +88,7 @@ ARG EXPECTED_HIPBLASLT=1.2.2
 
 RUN python3 -m venv .venv \
     && .venv/bin/pip install --no-cache-dir --upgrade pip \
-    && .venv/bin/pip install --no-cache-dir -r requirements.txt \
+    && .venv/bin/pip install --no-cache-dir -r terminal/requirements.txt \
     && chmod +x setup.sh docker-entrypoint-serve.sh
 
 # Fail loudly, naming the check that failed, on a base image whose hipBLASLt has no shipped
