@@ -108,10 +108,10 @@ RUN set -e; \
     pat=$(awk '/define HIPBLASLT_VERSION_PATCH/ {print $3}' "$h"); \
     code=$(( maj*100000 + min*100 + pat )); \
     arch=$(echo "${HIP_ARCHITECTURES}" | cut -d';' -f1); \
-    echo "hipBLASLt $maj.$min.$pat (code $code) -> table tools/hip/${arch}-hipblaslt-${code}.txt"; \
+    echo "hipBLASLt $maj.$min.$pat (code $code) -> table terminal/tools/hip/${arch}-hipblaslt-${code}.txt"; \
     test "$maj.$min.$pat" = "${EXPECTED_HIPBLASLT}" || \
       fail "hipBLASLt is $maj.$min.$pat but this build expects ${EXPECTED_HIPBLASLT} (the version the host's tuned config was measured with); pass --build-arg EXPECTED_HIPBLASLT=$maj.$min.$pat if the new one is intended"; \
-    test -f "tools/hip/${arch}-hipblaslt-${code}.txt" || \
+    test -f "terminal/tools/hip/${arch}-hipblaslt-${code}.txt" || \
       fail "no shipped hipBLASLt tuning table for $arch at $maj.$min.$pat - the tuned dense-prefill path would silently stop applying; pick a ROCM_IMAGE whose hipBLASLt has a table, or add one"
 
 # setup.py picks ROCm itself: a system ROCm with hipcc, libhipblas.so and the HIP development
