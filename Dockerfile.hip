@@ -162,7 +162,7 @@ RUN if [ "$BUILD_VISION" = "gpu" ]; then \
         test -x engine/strata-vision-hip && ldd engine/strata-vision-hip | grep -c "hip\|rocblas"; \
     elif [ "$BUILD_VISION" = "cpu" ]; then \
         test -x engine/strata-vision; \
-    fi && cat engine/BUILD.json
+    fi && (ls -l engine | head -20) && cat engine/BUILD.json
 
 # the cmake trees are build-time only; the engine itself is what the container needs
 RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata && cat engine/BUILD.json
