@@ -160,7 +160,7 @@ PYEOF
 # 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round).
 RUN if [ "$BUILD_VISION" = "gpu" ]; then \
         test -x engine/strata-vision-hip && ldd engine/strata-vision-hip | grep -c "hip\|rocblas"; \
-    else \
+    elif [ "$BUILD_VISION" = "cpu" ]; then \
         test -x engine/strata-vision; \
     fi && cat engine/BUILD.json
 
