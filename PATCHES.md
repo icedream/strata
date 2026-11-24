@@ -1,47 +1,71 @@
 # What this fork carries
 
-Base: upstream tag `v0.2.15` (`c77572806`). Fork tags are `<upstream>+icedream.<n>`; the image tag is
-`<upstream>-icedream.<n>-hip-gfx1100`. Bump `n` whenever a patch changes, never reuse a tag for
+Base: upstream tag `v0.2.20` (`4920a3a4`). Fork tags are `<upstream>+icedream.<n>`, the image tag is
+`<upstream>-icedream.<n>-hip-gfx1100`. Bump `n` when a patch changes; a tag is never reused for
 different bytes.
 
 ## Carried
 
-| Patch | Upstream reference | Base | Why we carry it | Can drop when |
-| --- | --- | --- | --- | --- |
-| `5af25366` HIP elastic cache: per-device VMM probe, segmented expert cache, `--vram-elastic` on Linux HIP | PR Niko1221/Strata#2399, commit `5af25366`, still open and draft | `v0.2.15` | the RX 7900 XTX member runs `--vram-elastic`, and its vision encoder borrows 2 GiB through `POST /v1/vram`; upstream refuses the flag on HIP | #2399 merges and the flag works on HIP without it |
+| Patch | Upstream reference | Why we carry it | Can drop when |
+| --- | --- | --- | --- |
+| HIP virtual memory: a device probe, `hipMem*` behind the CUDA VMM API, `--vram-elastic` on Linux | PR Niko1221/Strata#2399 (`5af25366`), open and draft | the gfx1100 member runs `--vram-elastic` and its vision encoder borrows VRAM through `POST /v1/vram`; upstream compiles the VMM layer for CUDA only and refuses the flag on HIP | #2399 merges and the flag works on HIP without it |
 
-Local change on top of it: `vmm_segment_unmap(va, bytes)` and `vmm_segment_release(handle)` are two
-functions, not one. Upstream's own `tests/core/expert_cache_segmented_test.cpp` and
-`include/strata/core/expert_cache_refuse.hpp` drive a refused unmap and a refused release separately,
-so the fused call could not satisfy them. `ExpertCache::shrink` keeps upstream's two-step flow and its
-`ec_test::refuse_segment_call` hooks; only the driver calls behind them are ours.
+Files: `engine/src/core/vmm.cpp` and `engine/include/strata/core/vmm.hpp` (the HIP side of `api()`,
+`VmmRange`, `vmm_off_reason()` and the segment API), `engine/src/program/generate.cpp` (the
+`--vram-elastic` gate: HIP on Linux is allowed when the probe passes, and names the probe's reason
+when it does not), `engine/tests/core/vmm_test.cpp`.
+
+Upstream 0.2.20 has the segmented expert cache itself, so `engine/src/core/expert_cache.cpp` is
+unpatched here and this carry is the driver layer only. The segment API it exposes
+(`vmm_reserve`, `vmm_segment_map`, `vmm_segment_unmap`, `vmm_segment_release`) has no caller on
+0.2.20, where the cache uses `VmmRange`; it is kept because the upstream patch ships it.
+
+## No longer carried
+
+The 0.2.15 line carried the segmented expert cache itself, its `ec_test::refuse_segment_call`
+hooks and a split `vmm_segment_unmap`/`vmm_segment_release`. Upstream 0.2.20 ships the cache and the
+hooks (`engine/include/strata/core/expert_cache_refuse.hpp`), so taking its `expert_cache.cpp`
+whole replaced all of it.
 
 ## Deliberately not carried
 
 | Commit | What it does | Why not |
 | --- | --- | --- |
-| `71ef01ec` share the growing K/V arena with `--vram-elastic` | extracts `kvg_take` / `kvg_give_back` so the K/V and the expert cache hand chunks to each other | `--kv-grow` is off whenever `--vram-elastic` or `--kv-resident` is set (`src/program/generate.cpp`, the `kvg.on` gate), and our member config sets both, so the code can never run. It also rewrites `kvg_ensure` / `kvg_trim`, which upstream changed after our base (`kvg.from_cache`, the `#1128` park hold, `kv_grow_target`), so it would need re-merging every release for nothing |
-
-Revisit only if a member starts using `--kv-grow` instead of `--vram-elastic`.
+| `71ef01ec` share the growing K/V arena with `--vram-elastic` | lets the K/V and the expert cache hand chunks to each other | `--kv-grow` is off whenever `--kv-resident`, `--vram-elastic` or `--batch` is set (`engine/src/program/generate.cpp`, the `kvg.on` gate), and the member config sets all three |
 
 ## Our own, not upstream patches
 
-- `Dockerfile.hip`, `Dockerfile.hip-tests`: build the HIP engine from source in the image. Upstream's
-  ready-made `ghcr.io/niko1221/strata:<version>-rocm-gfx110x` stops at 0.2.13 and does not carry the
-  `serve/server.py --config` start path below.
-- `docker-entrypoint-serve.sh`: starts `/opt/strata/serve/server.py --config <file>` instead of
-  upstream's `docker/entrypoint.sh`, which plans and tunes a model through `strata launch`.
+- `Dockerfile.hip`, `Dockerfile.hip-tests`: compile the HIP engine and the GPU picture reader inside
+  the image. Upstream's ready-made `-rocm-gfx110x` images start through `strata launch`, which plans
+  and tunes a model at every start, and they are not built for this card's ROCm.
+- `docker-entrypoint-serve.sh`: starts `terminal/serve/server.py --config <file>` from a finished
+  config instead. The cluster's start path passes the same arguments to that file directly.
 
-## Build recipe in service
+## Where the 0.2.20 layout differs from 0.2.15
+
+- `setup.py`, `serve/` and the shipped `data/` moved under `terminal/`. The image sets
+  `PYTHONPATH=/opt/strata/terminal` for the `serve` import.
+- The member configs name `--expert-profile /opt/strata/data/expert-profile.bin`. `Dockerfile.hip`
+  keeps `/opt/strata/data` as a symlink to `terminal/data`, so those configs read as they are.
+
+## Build recipe
+
+`kubed/images` builds the `strata-hip` service from a git URL at a pinned commit, so the cluster
+manifest, the `.env` ref and the fork tag have to agree:
 
 ```
-context:  git checkout of this tag (Dockerfile.hip tracked)
-base:     bitsea:5102/docker.io/rocm/dev-ubuntu-24.04:7.14.1-full (pin by digest)
-args:     HIP_ARCHITECTURES=gfx1100  EXPECTED_HIPBLASLT=1.4.1  BUILD_VISION=gpu
-builder:  docker-container, cpus=6 memory=20g swap=30g
-image:    bitsea:5100/icedream/strata:0.2.15-icedream.1-hip-gfx1100
+context:    https://github.com/icedream/strata.git#<commit of the fork tag>
+dockerfile: Dockerfile.hip
+args:       HIP_ARCHITECTURES=gfx1100  EXPECTED_HIPBLASLT=1.4.1  BUILD_VISION=gpu
 ```
 
-`EXPECTED_HIPBLASLT=1.4.1` matches `tools/hip/gfx1100-hipblaslt-100401.txt`, which is the table the
-member config points `STRATA_HIPBLASLT_TUNING` at. A base image whose hipBLASLt drifts from that fails
-the build instead of silently losing the tuned prefill path.
+`BUILD_VISION=gpu` is required, not a preference: the member config starts
+`engine/strata-vision-hip` for its `--vision` block, and the build fails without the reader.
+
+`EXPECTED_HIPBLASLT` must match a table in `terminal/tools/hip/` (`<arch>-hipblaslt-<code>.txt`,
+where the version encodes as MAJOR*100000 + MINOR*100 + PATCH). That table is the tuned
+dense-prefill path, and setup applies it only when the card architecture and the hipBLASLt version
+both match; the build fails rather than lose it silently.
+
+The engine's CPU kernels are compiled for the building machine's CPU, so the build runs on the host
+that serves the model.
