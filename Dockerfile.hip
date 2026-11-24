@@ -157,20 +157,25 @@ setup.build_engine_hip({"arch": archs[0], "archs": archs}, setup.get_llama_cpp()
 PYEOF
 
 # the encoder that has to be there depends on BUILD_VISION; a silent CPU fallback is what bit the
-# 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round).
-# Where the compile put things, then the stamp. Diagnostic first: the 0.2.20 tree moved pieces around
-# and a silent miss here means the container recompiles at start.
-RUN if [ "$BUILD_VISION" = "gpu" ]; then \
-        test -x engine/strata-vision-hip || echo "no HIP vision reader"; \
+# 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round). The
+# member config starts engine/strata-vision-hip for its --vision block, so a build that names gpu
+# and carries no reader has to fail here, not at the first picture.
+RUN set -e; \
+    if [ "$BUILD_VISION" = "gpu" ]; then \
+        test -x engine/strata-vision-hip || { echo "ERROR: BUILD_VISION=gpu but engine/strata-vision-hip is missing" >&2; exit 1; }; \
     elif [ "$BUILD_VISION" = "cpu" ]; then \
-        test -x engine/strata-vision || echo "no CPU vision reader"; \
+        test -x engine/strata-vision || { echo "ERROR: BUILD_VISION=cpu but engine/strata-vision is missing" >&2; exit 1; }; \
     fi; \
+    test -f engine/BUILD.json || { echo "ERROR: no engine/BUILD.json: the start would recompile the engine" >&2; exit 1; }; \
     ls -l engine | head -30; \
-    find /opt/strata -maxdepth 3 -name 'strata' -o -maxdepth 3 -name 'BUILD.json' | head -20; \
-    cat engine/BUILD.json 2>/dev/null || echo "WARNING: no stamp at engine/BUILD.json"
+    cat engine/BUILD.json
 
 # the cmake trees are build-time only; the engine itself is what the container needs
-RUN rm -rf build-hip build-vision build-vision-hip build; test -x engine/strata || echo "WARNING: no engine binary at engine/strata"
+RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata
+
+# 0.2.20 moved the shipped data/ under terminal/. The member configs name
+# --expert-profile /opt/strata/data/expert-profile.bin, so keep that path for them.
+RUN ln -sfn /opt/strata/terminal/data /opt/strata/data && test -f /opt/strata/data/expert-profile.bin
 
 # Run as the host user (compose passes user: ${UID}:${GID}) so the bind-mounted model tree
 # is writable and the container is not root. /opt/strata is written to at start (the config
@@ -195,5 +200,5 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=600s --retries=3 \
 
 # Upstream's docker/entrypoint.sh is not used: it plans and tunes a model through `strata launch`
 # and lists CONFIG / HOST as legacy env vars it ignores. This image names one finished config, so
-# it starts serve/server.py directly (see docker-entrypoint-serve.sh).
+# it starts terminal/serve/server.py directly (see docker-entrypoint-serve.sh).
 ENTRYPOINT ["./docker-entrypoint-serve.sh"]
