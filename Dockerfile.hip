@@ -160,18 +160,23 @@ PYEOF
 # 0.1.44.1 image, where .env said cpu and the Dockerfile built gpu (or the other way round). The
 # member config starts engine/strata-vision-hip for its --vision block, so a build that names gpu
 # and carries no reader has to fail here, not at the first picture.
+#
+# setup.py resolves its own directory as the root, so on 0.2.20 the binaries land in terminal/engine.
+# The configs name /opt/strata/engine, so copy them out of there and drop the cmake trees.
 RUN set -e; \
+    test -f terminal/engine/BUILD.json || { echo "ERROR: no stamp at terminal/engine/BUILD.json: the build produced no engine" >&2; exit 1; }; \
+    cp -a terminal/engine/. engine/; \
+    test -x engine/strata || { echo "ERROR: no engine binary at engine/strata" >&2; exit 1; }; \
     if [ "$BUILD_VISION" = "gpu" ]; then \
         test -x engine/strata-vision-hip || { echo "ERROR: BUILD_VISION=gpu but engine/strata-vision-hip is missing" >&2; exit 1; }; \
     elif [ "$BUILD_VISION" = "cpu" ]; then \
         test -x engine/strata-vision || { echo "ERROR: BUILD_VISION=cpu but engine/strata-vision is missing" >&2; exit 1; }; \
     fi; \
-    test -f engine/BUILD.json || { echo "ERROR: no engine/BUILD.json: the start would recompile the engine" >&2; exit 1; }; \
     ls -l engine | head -30; \
     cat engine/BUILD.json
 
-# the cmake trees are build-time only; the engine itself is what the container needs
-RUN rm -rf build-hip build-vision build-vision-hip build && test -x engine/strata
+# the cmake trees are build-time only; the binaries already sit in engine/
+RUN rm -rf terminal/build-hip terminal/build-vision terminal/build-vision-hip terminal/build
 
 # 0.2.20 moved the shipped data/ under terminal/. The member configs name
 # --expert-profile /opt/strata/data/expert-profile.bin, so keep that path for them.
