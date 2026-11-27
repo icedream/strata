@@ -164,9 +164,10 @@ PYEOF
 # BUILD_INKLING=0 keeps the image at the qwen engine only.
 RUN if [ "$BUILD_INKLING" = "1" ]; then set -e; \
         /opt/strata/.venv/bin/cmake --build terminal/build-hip --target strata-inkling -j"$(( $(nproc) / 2 ))"; \
-        test -x terminal/build-hip/strata-inkling || { echo "ERROR: BUILD_INKLING=1 but the build produced no terminal/build-hip/strata-inkling" >&2; exit 1; }; \
-        cp -a terminal/build-hip/strata-inkling terminal/engine/; \
-        echo "built strata-inkling into terminal/engine"; \
+        built=$(find terminal/build-hip -maxdepth 3 -type f -name strata-inkling -perm -u+x | head -1); \
+        test -n "$built" || { echo "ERROR: BUILD_INKLING=1 but the build produced no strata-inkling binary" >&2; exit 1; }; \
+        cp -a "$built" terminal/engine/; \
+        echo "built strata-inkling from $built"; \
     fi
 
 # the encoder that has to be there depends on BUILD_VISION; a silent CPU fallback is what bit the
