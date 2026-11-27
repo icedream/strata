@@ -237,6 +237,19 @@ def budget_effort(tokens) -> dict:
     return {"reasoning_effort": level}
 
 
+def reasoning_levels() -> list[str]:
+    """The levels this family's table answers, in table order, each named once ("high" and "xhigh" are one level),
+    with "none" first when the table can switch thinking off: what /v1/models publishes, so a client need not guess."""
+    levels = []
+    off = False
+    for level in EFFORT.values():
+        if level is None:
+            off = True                   # the table does have an off level: prefix "none"
+        elif level not in levels:
+            levels.append(level)
+    return (["none"] + levels) if off else levels
+
+
 def _has_image(content) -> bool:
     return isinstance(content, list) and any(isinstance(p, dict) and p.get("type") in IMAGE_PARTS for p in content)
 

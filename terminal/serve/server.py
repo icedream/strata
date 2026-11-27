@@ -7817,6 +7817,7 @@ def make_handler(svc: Service):
                 self._json(200, s)
             elif path in ("/v1/models", "/models") or path.startswith(("/v1/models/", "/models/")):
                 if self._authorized():
+                    import serve.frontend as _frontend            # the family's own effort table, as set_family picks it
                     loaded = svc.loaded()
                     ctx = svc.reported_ctx()
                     created = int(getattr(svc, "started_at", 0) or time.time())
@@ -7833,6 +7834,10 @@ def make_handler(svc: Service):
                              "meta": {"n_ctx": ctx, "llamaswap": {"max_output_tokens": cap}},
                              "architecture": {"input_modalities": ["text", "image"] if svc.has_vision() else ["text"],
                                               "output_modalities": ["text"]}}
+                    levels = _frontend.reasoning_levels()          # the thinking levels this model answers, from its table
+                    if levels:
+                        model["capabilities"] = ["reasoning"]
+                        model["params"] = {"reasoning": {"supported": levels}}
                     if not loaded and (svc.idle_unload_s or getattr(svc.engine, "unloaded", False)):
                         model["status"] = {"value": "unloaded"}   # like llama-server's router: listed, loads on use
                         loaded = True

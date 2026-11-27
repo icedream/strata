@@ -21,6 +21,7 @@ from pathlib import Path
 from unittest import mock
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from serve import frontend  # noqa: E402
 from serve.frontend import ChatTemplate, literal_tags, mark_think_literals, unmark_think_literals  # noqa: E402
 from serve.server import (ANSWER_RESERVE_MIN, CTX_SLACK, ByteTokenizer, EngineDied, EngineNonFinite, GpuBusy, MockEngine,  # noqa: E402
                           PP_DONE_TAIL, Service,
@@ -3980,6 +3981,22 @@ class TemplateCaps(unittest.TestCase):
             self.assertFalse(any(caps.values()))
 
 
+class ReasoningLevels(unittest.TestCase):
+    """The thinking levels /v1/models names, derived from the family's own effort table (EFFORT) and never from a
+    second list: a family that ships another table reports its own words."""
+
+    def test_the_qwen_table(self):
+        self.assertEqual(frontend.reasoning_levels(), ["none", "low", "medium", "xhigh"])   # "high", "max", "maximum" are xhigh
+
+    def test_levels_named_only_by_aliases(self):
+        with mock.patch.dict(frontend.EFFORT, {"easy": "medium", "trivial": "medium"}, clear=True):
+            self.assertEqual(frontend.reasoning_levels(), ["medium"])   # two spellings, one level, and no "none" to prefix
+
+    def test_a_table_that_cannot_switch_thinking_off(self):
+        with mock.patch.dict(frontend.EFFORT, {"low": "low", "medium": "medium", "high": "xhigh"}, clear=True):
+            self.assertEqual(frontend.reasoning_levels(), ["low", "medium", "xhigh"])   # "high" is xhigh; no None, so no "none"
+
+
 class WebApp(unittest.TestCase):
     """The web app (PR #22's dashboard idea, rebuilt): its page and files, and GET /metrics."""
 
@@ -4055,6 +4072,8 @@ class WebApp(unittest.TestCase):
                     self.assertEqual((model["max_model_len"], model["context_length"], model["max_context_length"]), (262144, 262144, 262144))
                     self.assertEqual(model["architecture"]["input_modalities"],
                                      ["text", "image"] if vision else ["text"])
+                    self.assertEqual(model["capabilities"], ["reasoning"])
+                    self.assertEqual(model["params"]["reasoning"]["supported"], ["none", "low", "medium", "xhigh"])
                 code, _, body = self.get("/props?model=" + svc.model + "&autoload=false")
                 self.assertEqual(code, 200)
                 props = json.loads(body)
