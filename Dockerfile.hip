@@ -162,7 +162,7 @@ PYEOF
 # defaults ON), so the target is already configured in the build tree the step above created and
 # compiles with the same ROCm flags. BUILD_INKLING=0 keeps the image at the qwen engine only.
 RUN if [ "$BUILD_INKLING" = "1" ]; then set -e; \
-        cmake --build terminal/build-hip --target strata-inkling -j"$(nproc)"; \
+        cmake --build terminal/build-hip --target strata-inkling -j"$(( $(nproc) / 2 ))"; \
         test -x terminal/build-hip/strata-inkling || { echo "ERROR: BUILD_INKLING=1 but the build produced no terminal/build-hip/strata-inkling" >&2; exit 1; }; \
         cp -a terminal/build-hip/strata-inkling terminal/engine/; \
         echo "built strata-inkling into terminal/engine"; \
