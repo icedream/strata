@@ -160,9 +160,10 @@ PYEOF
 # strata-inkling is the second shape engine (Inkling-2-Mini, .strata v1.1, safetensors or GGUF).
 # 0.2.22's engine/CMakeLists.txt adds it whenever STRATA_ENABLE_HIP is on (STRATA_BUILD_INKLING
 # defaults ON), so the target is already configured in the build tree the step above created and
-# compiles with the same ROCm flags. BUILD_INKLING=0 keeps the image at the qwen engine only.
+# compiles with the same ROCm flags. CMake here is the venv one setup.py installed, not on PATH.
+# BUILD_INKLING=0 keeps the image at the qwen engine only.
 RUN if [ "$BUILD_INKLING" = "1" ]; then set -e; \
-        cmake --build terminal/build-hip --target strata-inkling -j"$(( $(nproc) / 2 ))"; \
+        /opt/strata/.venv/bin/cmake --build terminal/build-hip --target strata-inkling -j"$(( $(nproc) / 2 ))"; \
         test -x terminal/build-hip/strata-inkling || { echo "ERROR: BUILD_INKLING=1 but the build produced no terminal/build-hip/strata-inkling" >&2; exit 1; }; \
         cp -a terminal/build-hip/strata-inkling terminal/engine/; \
         echo "built strata-inkling into terminal/engine"; \
